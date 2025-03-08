@@ -1,0 +1,368 @@
+# ====================== 数据预处理 ======================
+import os
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+from tqdm import tqdm  # 用于显示训练进度条
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split
+
+# 读取数据
+bike_df = pd.read_csv('/Users/by-augety/Desktop/非常重要🎓/进度/共享单车数据12.csv')
+
+# ====================== 时间/事件特征工程 ======================
+# 转换为 datetime 并排序
+bike_df['datetime'] = pd.to_datetime(bike_df['end_date'] + ' ' + bike_df['end_time'])
+bike_df = bike_df.sort_values(by='datetime').reset_index(drop=True)
+
+# 添加时间特征
+def add_time_features(df):
+    """为数据集添加时间相关的特征"""
+    # 时间编码
+    df['hour_sin'] = np.sin(2 * np.pi * df['datetime'].dt.hour / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['datetime'].dt.hour / 24)
+    df['day_of_week'] = df['datetime'].dt.dayofweek
+    df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+    df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+    df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+    df['month_sin'] = np.sin(2 * np.pi * df['datetime'].dt.month / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['datetime'].dt.month / 12)
+    # 时间间隔
+    df['delta_t'] = df['datetime'].diff().dt.total_seconds().div(60).fillna(0)
+    return df
+
+bike_df = add_time_features(bike_df)
+
+# 独热编码
+bike_df = pd.get_dummies(bike_df, columns=['end_subway_type'], prefix='subway_type')
+
+# 添加滑动窗口统计特征
+def add_window_statistics(df, window_size=15):
+    """为滑动窗口添加统计特征"""
+    df['window_demand_mean'] = df['Arrive_demand_15mins'].rolling(
+        window=window_size, min_periods=1, closed='left'
+    ).mean()
+    df['window_demand_std'] = df['Arrive_demand_15mins'].rolling(
+        window=window_size, min_periods=1, closed='left'
+    ).std().fillna(0)
+    return df
+
+bike_df = add_window_statistics(bike_df)
+
+# 定义特征列
+features = [
+    'month_sin', 'month_cos', 'day_sin', 'day_cos', 'is_weekend', 'hour_sin', 'hour_cos',
+    'is_peak', 'end_temperature', 'end_wind_speed', 'end_precipitation', 'end_humidity',
+    'window_demand_mean', 'window_demand_std', 'subway_type_居住型', 'subway_type_交通型',
+    'subway_type_混合型', 'subway_type_产业型', 'subway_type_商服型', 'subway_type_公共型'
+]
+
+# ====================== 划分数据集 ======================
+# 按时间顺序划分数据集
+total_samples = len(bike_df)
+train_end = int(total_samples * 0.7)  # 训练集结束位置
+val_end = train_end + int(total_samples * 0.15)  # 验证集结束位置
+
+# 划分数据集
+train_df = bike_df.iloc[:train_end].copy()
+val_df = bike_df.iloc[train_end:val_end].copy()
+test_df = bike_df.iloc[val_end:].copy()
+
+# ====================== 标准化连续特征 ======================
+# 定义连续特征
+cont_features = ['end_temperature', 'end_wind_speed', 'end_precipitation', 'end_humidity']
+
+# 初始化标准化器
+scaler_arrive = StandardScaler()
+
+# 只在训练集上 fit，其他集用相同参数 transform
+train_df[cont_features] = scaler_arrive.fit_transform(train_df[cont_features])
+val_df[cont_features] = scaler_arrive.transform(val_df[cont_features])
+test_df[cont_features] = scaler_arrive.transform(test_df[cont_features])
+
+# 目标值标准化
+target_scaler = MinMaxScaler()
+train_df['scaled_arrive_demand'] = target_scaler.fit_transform(train_df[['Arrive_demand_15mins']])
+val_df['scaled_arrive_demand'] = target_scaler.transform(val_df[['Arrive_demand_15mins']])
+test_df['scaled_arrive_demand'] = target_scaler.transform(test_df[['Arrive_demand_15mins']])
+
+# ====================== 滑动窗口生成 ======================
+def generate_sequences(df, window_size):
+    """生成滑动窗口序列"""
+    X_sequences = []
+    y_targets = []
+    for i in range(window_size, len(df)):
+        window_data = df.iloc[i - window_size : i][features].values
+        window_data = window_data.astype(np.float32)  # 显式转换为 float32
+        X_sequences.append(window_data)
+        y_targets.append(df.iloc[i]['scaled_arrive_demand'])
+    
+    # 转换为 NumPy 数组
+    X_sequences = np.array(X_sequences, dtype=np.float32)
+    y_targets = np.array(y_targets, dtype=np.float32)
+    
+    # 检查并处理无效值
+    if np.isnan(X_sequences).any() or np.isinf(X_sequences).any():
+        X_sequences = np.nan_to_num(X_sequences, nan=0.0, posinf=0.0, neginf=0.0)
+    if np.isnan(y_targets).any() or np.isinf(y_targets).any():
+        y_targets = np.nan_to_num(y_targets, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    return X_sequences, y_targets
+
+# 生成训练、验证、测试集的窗口
+WINDOW_SIZE = 15
+X_train, y_train = generate_sequences(train_df, WINDOW_SIZE)
+X_val, y_val = generate_sequences(val_df, WINDOW_SIZE)
+X_test, y_test = generate_sequences(test_df, WINDOW_SIZE)
+
+# ====================== 转换为张量 ======================
+# 转换为 PyTorch 张量
+X_train_tensor = torch.FloatTensor(X_train)
+y_train_tensor = torch.FloatTensor(y_train)
+X_val_tensor = torch.FloatTensor(X_val)
+y_val_tensor = torch.FloatTensor(y_val)
+X_test_tensor = torch.FloatTensor(X_test)
+y_test_tensor = torch.FloatTensor(y_test)
+
+# 创建 DataLoader
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=False)
+val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+# ====================== 模型定义 ======================
+class LSTM_Model(nn.Module):
+    """基础 LSTM 模型"""
+    def __init__(self, input_size, hidden_size=256, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, dropout=0.5, batch_first=True)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 1)
+        )
+    
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])  # 取最后一个时间步的输出
+
+class BiLSTM_Model(nn.Module):
+    """双向 LSTM 模型"""
+    def __init__(self, input_size, hidden_size=256, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, dropout=0.5, batch_first=True, bidirectional=True)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 2, 128),  # 双向 LSTM 输出维度是 hidden_size * 2
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 1)
+        )
+    
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+class MultiHeadAttention(nn.Module):
+    """多头注意力机制"""
+    def __init__(self, hidden_size, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_size = hidden_size // num_heads
+        self.query = nn.Linear(hidden_size, hidden_size)
+        self.key = nn.Linear(hidden_size, hidden_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        self.fc = nn.Linear(hidden_size, hidden_size)  # 最终输出注意力权重
+
+    def forward(self, lstm_out):
+        batch_size, seq_len, _ = lstm_out.shape
+        # 分割为多个头
+        Q = self.query(lstm_out).view(batch_size, seq_len, self.num_heads, self.head_size).transpose(1, 2)
+        K = self.key(lstm_out).view(batch_size, seq_len, self.num_heads, self.head_size).transpose(1, 2)
+        V = self.value(lstm_out).view(batch_size, seq_len, self.num_heads, self.head_size).transpose(1, 2)
+        
+        # 计算注意力得分
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.head_size, dtype=torch.float32))
+        attn_weights = torch.softmax(scores, dim=-1)
+        
+        # 加权求和
+        context = torch.matmul(attn_weights, V).transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return context
+
+class LSTM_AM_Model(nn.Module):
+    """LSTM + 注意力机制模型"""
+    def __init__(self, input_size, hidden_size=256, num_layers=2, num_heads=4):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, dropout=0.5, batch_first=True)
+        self.attention = MultiHeadAttention(hidden_size, num_heads)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 1)
+        )
+    
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        attn_out = self.attention(lstm_out)
+        return self.fc(attn_out[:, -1, :])  # 取最后一个时间步的输出
+
+class BiLSTM_AM_Model(nn.Module):
+    """双向 LSTM + 注意力机制模型"""
+    def __init__(self, input_size, hidden_size=256, num_layers=2, num_heads=4):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, dropout=0.5, batch_first=True, bidirectional=True)
+        self.attention = MultiHeadAttention(hidden_size * 2, num_heads)  # 双向 LSTM 输出维度是 hidden_size * 2
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 2, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 1)
+        )
+    
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        attn_out = self.attention(lstm_out)
+        return self.fc(attn_out[:, -1, :])
+
+# ====================== 训练函数 ======================
+def train_model(model, train_loader, val_loader, epochs, patience):
+    """训练函数，支持早停机制"""
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    criterion = nn.L1Loss()  # 使用 MAE 作为损失函数
+    
+    best_loss = float('inf')
+    best_epoch = 0
+    patience_counter = 0
+    
+    # 记录训练和验证损失
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for X_batch, y_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(X_batch).squeeze()
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * X_batch.size(0)
+        
+        # 计算平均训练损失
+        train_loss = train_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X_val_batch, y_val_batch in val_loader:
+                X_val_batch, y_val_batch = X_val_batch.to(device), y_val_batch.to(device)
+                outputs = model(X_val_batch).squeeze()
+                val_loss += criterion(outputs, y_val_batch).item() * X_val_batch.size(0)
+        
+        # 计算平均验证损失
+        val_loss = val_loss / len(val_loader.dataset)
+        val_losses.append(val_loss)
+        
+        # 保存最佳模型
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_epoch = epoch
+            patience_counter = 0
+            torch.save(model.state_dict(), f'best_{model.__class__.__name__}.pth')
+        else:
+            patience_counter += 1
+        
+        print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        
+        # 早停机制
+        if patience_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
+    
+    # 加载最佳模型
+    model.load_state_dict(torch.load(f'best_{model.__class__.__name__}.pth'))
+    print(f"Best model from epoch {best_epoch+1} with Val Loss: {best_loss:.4f} loaded.")
+    
+    return model
+
+# ====================== 模型训练执行 ======================
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# 定义所有模型
+models = {
+    'LSTM': LSTM_Model(input_size=len(features)),
+    'LSTM-AM': LSTM_AM_Model(input_size=len(features)),
+    'BiLSTM': BiLSTM_Model(input_size=len(features)),
+    'BiLSTM-AM': BiLSTM_AM_Model(input_size=len(features))
+}
+
+# 训练所有模型
+for model_name, model in models.items():
+    print(f"\n===== 训练 {model_name} 模型 =====")
+    trained_model = train_model(
+        model, 
+        train_loader, 
+        val_loader, 
+        epochs=100, 
+        patience=10
+    )
+    torch.save(trained_model.state_dict(), f'final_{model_name}_model.pth')
+
+# ====================== 模型评估函数 ======================
+def evaluate_model(model, test_loader, target_scaler):
+    """评估模型性能，计算 MAE、MSE、RMSE、MAPE 和 R²"""
+    model.eval()
+    y_true = []
+    y_pred = []
+    
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch).squeeze()
+            y_true.extend(y_batch.cpu().numpy())
+            y_pred.extend(outputs.cpu().numpy())
+    
+    # 反标准化目标值
+    y_true = target_scaler.inverse_transform(np.array(y_true).reshape(-1, 1)).flatten()
+    y_pred = target_scaler.inverse_transform(np.array(y_pred).reshape(-1, 1)).flatten()
+    
+    # 计算指标
+    mae = mean_absolute_error(y_true, y_pred)  # MAE
+    mse = mean_squared_error(y_true, y_pred)  # MSE
+    rmse = np.sqrt(mse)  # RMSE
+    r2 = r2_score(y_true, y_pred)  # R²
+    
+    # 计算 MAPE（避免除以零）
+    nonzero_mask = y_true != 0  # 仅对非零值计算 MAPE
+    mape = np.mean(np.abs((y_true[nonzero_mask] - y_pred[nonzero_mask]) / y_true[nonzero_mask])) * 100  # MAPE（百分比形式）
+    
+    return {
+        'MAE': mae,
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAPE': mape,
+        'R2': r2
+    }
+
+# ====================== 模型评估执行 ======================
+# 加载所有模型的最佳权重
+for model_name, model in models.items():
+    model.load_state_dict(torch.load(f'final_{model_name}_model.pth'))
+    print(f"\n===== 评估 {model_name} 模型 =====")
+    metrics = evaluate_model(model, test_loader, target_scaler)
+    print(f"MAE: {metrics['MAE']:.4f}")
+    print(f"MSE: {metrics['MSE']:.4f}")
+    print(f"RMSE: {metrics['RMSE']:.4f}")
+    print(f"MAPE: {metrics['MAPE']:.4f}%")
+    print(f"R²: {metrics['R2']:.4f}")
