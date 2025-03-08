@@ -11,7 +11,7 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 
 # 读取数据
-bike_df = pd.read_csv('/Users/by-augety/Desktop/非常重要🎓/进度/共享单车数据12.csv')
+bike_df = pd.read_csv('')
 
 # ====================== 时间/事件特征工程 ======================
 # 转换为 datetime 并排序
